@@ -3,14 +3,26 @@ Reiselivsdashbord for Akershus
 ================================
 Kjør lokalt med:  streamlit run app.py
 
-Datakilde: SSB Statistikkbanken (PxWebApi v2), tabellene 14172-14177 og 07459.
-Se README.md for forbehold om datadekning (korttidsutleie, verdiskaping).
+Datakilde: SSB Statistikkbanken (PxWebApi v2), tabellene 14172-14177 og
+07459, samt Innovasjon Norges verdiskapingstall for reiselivet
+(verdiskaping_akershus.csv). Se fanen "Om data og forbehold" i selve
+appen for forbehold om datadekning.
+
+NB: All kode ligger bevisst i denne ene filen (i stedet for flere moduler
+i undermapper) for å unngå at enkeltfiler mistes ved opplasting til
+GitHub via nettleseren.
 """
 
 from __future__ import annotations
 
+import json
+from datetime import date
+from functools import lru_cache
+from typing import Any
+
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 
 st.set_page_config(
@@ -19,34 +31,413 @@ st.set_page_config(
     layout="wide",
 )
 
+# =============================================================================
+# KONFIGURASJON
+# =============================================================================
+
+
 # ---------------------------------------------------------------------------
-# Robust import av egne moduler: Streamlit sladder normalt den ekte
-# feilmeldingen ved en ModuleNotFoundError ("for å hindre datalekkasjer") og
-# viser bare hvilken linje i app.py som utløste den -- ikke hvilken pakke som
-# faktisk mangler. Vi fanger derfor feilen selv og skriver den ut i klartekst,
-# sammen med en sjekkliste, slik at den er mulig å rette uten å måtte lete i
-# Streamlit Cloud-loggene.
+# Geografi
 # ---------------------------------------------------------------------------
-try:
-    import data_loader as dl
-    import verdiskaping as vsk
-    from config import FYLKE_NAVN, MONTHS, REISELIVSREGIONER, START_YEAR, YEARS
-    from ssb_client import SSBApiError
-except ModuleNotFoundError as exc:
-    st.error(f"Appen mangler en fil eller avhengighet og kan ikke starte: **{exc}**")
-    st.markdown(
-        """
-**Sjekkliste:**
-1. Ligger `config.py`, `ssb_client.py`, `data_loader.py`, `verdiskaping.py`
-   og `verdiskaping_akershus.csv` alle direkte i repo-**roten**, på samme
-   nivå som `app.py`? (Denne versjonen bruker ingen undermapper — hvis en
-   av disse filene mangler i GitHub-repoet ditt, er det årsaken.)
-2. Ligger `requirements.txt` også i repo-roten?
-3. Prøv "Reboot app" under "Manage app" på Streamlit Cloud etter at du har
-   rettet punktene over.
-        """
+
+FYLKE_NAVN = "Akershus"
+
+# SSBs offisielle reiselivsregion-koder (brukes direkte mot tabell 14172-14177,
+# som SSB publiserer PÅ reiselivsregion-nivå -- ingen aggregering nødvendig).
+REISELIVSREGIONER: dict[str, str] = {
+    "32101": "Asker/Bærum",
+    "32102": "Follo",
+    "32103": "Romerike/Hadeland",
+}
+
+# Kommuner per reiselivsregion (4-sifret SSB-kommunenummer, uten "K-"-prefiks).
+# Brukes for tabeller som KUN finnes på kommunenivå (f.eks. befolkning 07459
+# dersom fylkes-/regiontall ikke er tilgjengelig direkte).
+KOMMUNER_PER_REGION: dict[str, list[str]] = {
+    "32101": ["3201", "3203"],  # Bærum, Asker
+    "32102": ["3207", "3212", "3214", "3216", "3218", "3220"],
+    # Nordre Follo, Nesodden, Frogn, Vestby, Ås, Enebakk
+    "32103": [
+        "3205", "3209", "3222", "3224", "3226", "3228", "3230",
+        "3232", "3234", "3236", "3238", "3240", "3242",
+    ],
+    # Lillestrøm, Ullensaker, Lørenskog, Rælingen, Aurskog-Høland, Nes,
+    # Gjerdrum, Nittedal, Lunner, Jevnaker, Nannestad, Eidsvoll, Hurdal
+}
+
+ALLE_KOMMUNER: list[str] = [k for ks in KOMMUNER_PER_REGION.values() for k in ks]
+ALLE_REGIONKODER: list[str] = list(REISELIVSREGIONER.keys())
+
+# ---------------------------------------------------------------------------
+# SSB-tabeller (PxWebApi v2, https://data.ssb.no/api/pxwebapi/v2/tables/<id>)
+# ---------------------------------------------------------------------------
+
+TABLES: dict[str, str] = {
+    "overnattinger": "14172",          # Overnattinger per reiselivsregion
+    "kapasitet_bedrifter": "14173",    # Åpne bedrifter/rom/hytter/senger
+    "ankomne_gjester": "14174",        # Ankomne gjester
+    "overnatting_formal": "14175",     # Overnatting etter formål (hotell)
+    "omsetning_utnyttelse": "14176",   # Omsetning og kapasitetsutnyttelse (hotell)
+    "nokkelindikatorer": "14177",      # Nøkkelindikatorer (hotell, bl.a. RevPAR)
+    "befolkning": "07459",             # Befolkning
+}
+
+# NB: Korttidsutleie (Airbnb/Booking.com o.l.) er bevisst holdt utenfor
+# omfanget til dette dashbordet (avklart med oppdragsgiver) og hentes derfor
+# ikke inn i det hele tatt.
+
+# ---------------------------------------------------------------------------
+# Verdiskaping (Innovasjon Norge / Menon-tall, levert som Excel-uttrekk)
+# ---------------------------------------------------------------------------
+
+# Lokal kopi av "Aggregerte Data"-arket fra Innovasjon Norges verdiskapings-
+# rapport, filtrert til Akershus sine 21 kommuner. Kolonner:
+# Regnskapsår, Fylke, Kommune, Landsdel, Næring, Sektor, Verdiskaping,
+# Ansatte, Årsverk, Foretak, Aktive Foretak.
+VERDISKAPING_CSV = "verdiskaping_akershus.csv"
+VERDISKAPING_MAX_YEAR = 2024  # nyeste år i kildefilen -- oppdater ved ny import
+
+# ---------------------------------------------------------------------------
+# Periode
+# ---------------------------------------------------------------------------
+
+START_YEAR = 2024
+TODAY = date.today()
+YEARS = list(range(START_YEAR, TODAY.year + 1))
+MONTHS = [
+    (1, "Januar"), (2, "Februar"), (3, "Mars"), (4, "April"),
+    (5, "Mai"), (6, "Juni"), (7, "Juli"), (8, "August"),
+    (9, "September"), (10, "Oktober"), (11, "November"), (12, "Desember"),
+]
+
+SSB_API_BASE = "https://data.ssb.no/api/pxwebapi/v2/tables"
+
+# =============================================================================
+# SSB PXWEBAPI V2 -- GENERISK KLIENT
+# =============================================================================
+
+TIMEOUT = 60
+
+
+class SSBApiError(RuntimeError):
+    pass
+
+
+@lru_cache(maxsize=32)
+def get_metadata(table_id: str, lang: str = "no") -> dict[str, Any]:
+    """Hent metadata (variabler + koder) for en tabell. Cachet i prosessen."""
+    url = f"{SSB_API_BASE}/{table_id}/metadata"
+    resp = requests.get(url, params={"lang": lang}, timeout=TIMEOUT)
+    if not resp.ok:
+        raise SSBApiError(
+            f"Klarte ikke hente metadata for tabell {table_id}: "
+            f"{resp.status_code} {resp.text[:300]}"
+        )
+    return resp.json()
+
+
+def _dimension_items(metadata: dict[str, Any]) -> list[tuple[str, str]]:
+    """
+    Returner (variabel_id, label) for hver dimensjon i tabellen, uansett
+    hvilket av de to metadata-formatene SSB svarer med:
+
+    - Nyere JSON-stat2-stil (nå standard i PxWebApi v2):
+      {"id": ["Region", "Tid", ...], "dimension": {"Region": {"label": "region", ...}, ...}}
+    - Eldre PxWebApi v1-stil:
+      {"variables": [{"id": "Region", "label": "region"}, ...]}
+    """
+    if isinstance(metadata.get("dimension"), dict):
+        order = metadata.get("id") or list(metadata["dimension"].keys())
+        return [(var_id, metadata["dimension"].get(var_id, {}).get("label", "")) for var_id in order]
+    return [(v.get("id", ""), v.get("label", "")) for v in metadata.get("variables", [])]
+
+
+def find_variable(metadata: dict[str, Any], *keywords: str) -> dict[str, Any] | None:
+    """
+    Finn første variabel i metadata der id ELLER label matcher et av nøkkelordene
+    (case-insensitive substring-match). Returnerer {"id": ..., "label": ...},
+    eller None hvis ingen treff.
+    """
+    for var_id, label in _dimension_items(metadata):
+        haystack = f"{var_id} {label}".lower()
+        if any(k.lower() in haystack for k in keywords):
+            return {"id": var_id, "label": label}
+    return None
+
+
+def variable_ids(metadata: dict[str, Any]) -> list[str]:
+    return [var_id for var_id, _ in _dimension_items(metadata)]
+
+
+def build_query_url(
+    table_id: str,
+    value_codes: dict[str, str],
+    lang: str = "no",
+    output_format: str = "json-stat2",
+) -> str:
+    """
+    Bygg en fullstendig GET-URL mot PxWebApi v2.
+
+    value_codes: {variabel_id: kode_uttrykk}, f.eks.
+        {"Region": "32101,32102,32103", "Tid": "from(2024M01)", "ContentsCode": "*"}
+    Kode-uttrykk følger PxWebApi-syntaks: "*", "top(3)", "from(2024M01)", "01,02".
+    """
+    parts = [f"lang={lang}", f"outputFormat={output_format}"]
+    for var_id, codes in value_codes.items():
+        parts.append(f"valueCodes[{var_id}]={codes}")
+    return f"{SSB_API_BASE}/{table_id}/data?" + "&".join(parts)
+
+
+def fetch_table(table_id: str, value_codes: dict[str, str], lang: str = "no") -> pd.DataFrame:
+    """Hent data fra en SSB-tabell og returner som "lang" pandas DataFrame."""
+    url = build_query_url(table_id, value_codes, lang=lang)
+    resp = requests.get(url, timeout=TIMEOUT)
+    if not resp.ok:
+        raise SSBApiError(
+            f"SSB-spørring feilet for tabell {table_id}:\n{url}\n"
+            f"Status {resp.status_code}: {resp.text[:500]}"
+        )
+    return jsonstat_to_dataframe(resp.text)
+
+
+def jsonstat_to_dataframe(jsonstat_text: str) -> pd.DataFrame:
+    """Konverter JSON-stat2-respons til en pandas DataFrame med lesbare kolonner."""
+    try:
+        from pyjstat import pyjstat
+    except ImportError as exc:  # pragma: no cover
+        raise SSBApiError(
+            "Mangler pakken 'pyjstat'. Kjør: pip install pyjstat"
+        ) from exc
+
+    data = json.loads(jsonstat_text)
+    ds = pyjstat.Dataset.read(data)
+    df = ds.write("dataframe")
+    # pyjstat gir egne kolonnenavn per dimensjon-label og en "value"-kolonne.
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def fetch_all_wildcard(
+    table_id: str,
+    region_codes: list[str],
+    year_from: int,
+    region_var_hint: str = "region",
+) -> pd.DataFrame:
+    """
+    Hent en tabell for gitte regionkoder og fra et gitt år, med alle andre
+    dimensjoner (innkvarteringstype, bostedsland, ContentsCode, osv.) tatt med
+    i sin helhet ("*"). Dette gir en "rå" lang tabell som appen selv pivoterer
+    og filtrerer videre -- trygt valg når vi ikke kjenner alle dimensjonsnavn
+    på forhånd.
+    """
+    meta = get_metadata(table_id)
+    region_var = find_variable(meta, region_var_hint, "omrade", "område")
+    tid_var = find_variable(meta, "tid", "time")
+
+    if region_var is None or tid_var is None:
+        raise SSBApiError(
+            f"Fant ikke region- eller tidsvariabel i metadata for tabell "
+            f"{table_id}. Variabler funnet: {variable_ids(meta)}"
+        )
+
+    value_codes = {
+        region_var["id"]: ",".join(region_codes),
+        tid_var["id"]: f"from({year_from}M01)",
+    }
+    for var_id in variable_ids(meta):
+        if var_id not in value_codes:
+            value_codes[var_id] = "*"
+
+    return fetch_table(table_id, value_codes)
+
+# =============================================================================
+# DATALASTING PER TABELL (cachet)
+# =============================================================================
+
+CACHE_TTL_SECONDS = 60 * 60 * 6  # 6 timer -- SSB oppdaterer typisk 1x/mnd
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Henter overnattingstall fra SSB …")
+def load_overnattinger(year_from: int) -> pd.DataFrame:
+    """
+    Tabell 14172: Overnattinger per reiselivsregion, etter innkvarteringstype
+    og gjestenes bostedsland. Rå, lang tabell -- appen pivoterer selv.
+    """
+    return fetch_all_wildcard(
+        TABLES["overnattinger"], ALLE_REGIONKODER, year_from
     )
-    st.stop()
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Henter kapasitetstall fra SSB …")
+def load_kapasitet(year_from: int) -> pd.DataFrame:
+    """Tabell 14173: Åpne bedrifter, rom/hytter/senger per reiselivsregion."""
+    return fetch_all_wildcard(
+        TABLES["kapasitet_bedrifter"], ALLE_REGIONKODER, year_from
+    )
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Henter gjestetall fra SSB …")
+def load_ankomne_gjester(year_from: int) -> pd.DataFrame:
+    """Tabell 14174: Ankomne gjester per reiselivsregion."""
+    return fetch_all_wildcard(
+        TABLES["ankomne_gjester"], ALLE_REGIONKODER, year_from
+    )
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Henter formålsdata (hotell) fra SSB …")
+def load_overnatting_formal(year_from: int) -> pd.DataFrame:
+    """Tabell 14175: Hotell -- overnattinger etter formål med oppholdet."""
+    return fetch_all_wildcard(
+        TABLES["overnatting_formal"], ALLE_REGIONKODER, year_from
+    )
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Henter omsetning/kapasitetsutnyttelse fra SSB …")
+def load_omsetning_utnyttelse(year_from: int) -> pd.DataFrame:
+    """Tabell 14176: Hotell -- omsetning og kapasitetsutnyttelse."""
+    return fetch_all_wildcard(
+        TABLES["omsetning_utnyttelse"], ALLE_REGIONKODER, year_from
+    )
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Henter nøkkelindikatorer (bl.a. RevPAR) fra SSB …")
+def load_nokkelindikatorer(year_from: int) -> pd.DataFrame:
+    """Tabell 14177: Hotell -- nøkkelindikatorer (bl.a. RevPAR, omsetning/gjest)."""
+    return fetch_all_wildcard(
+        TABLES["nokkelindikatorer"], ALLE_REGIONKODER, year_from
+    )
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner="Henter befolkningstall fra SSB …")
+def load_befolkning(year_from: int) -> pd.DataFrame:
+    """
+    Tabell 07459: Befolkning. Denne publiseres normalt på KOMMUNE-nivå
+    (ikke reiselivsregion), så vi henter per kommune og mapper til region
+    selv -- se `map_kommune_to_region`.
+    """
+    df = fetch_all_wildcard(
+        TABLES["befolkning"], ALLE_KOMMUNER, year_from, region_var_hint="region"
+    )
+    return map_kommune_to_region(df)
+
+
+def map_kommune_to_region(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Legger til en kolonne 'Reiselivsregion' basert på kommunenummer funnet i
+    en av kolonnene til df (SSB returnerer kommune som tekstlabel, f.eks.
+    "3201 Bærum" -- vi matcher på kommunenummeret først i strengen).
+    """
+    kommune_to_region: dict[str, str] = {}
+    for region_code, kommuner in KOMMUNER_PER_REGION.items():
+        for k in kommuner:
+            kommune_to_region[k] = REISELIVSREGIONER[region_code]
+
+    region_col_candidates = [c for c in df.columns if "region" in c.lower() or "kommun" in c.lower()]
+    geo_col = region_col_candidates[0] if region_col_candidates else df.columns[0]
+
+    def _lookup(value: str) -> str | None:
+        value = str(value)
+        for kode, navn in kommune_to_region.items():
+            if value.startswith(kode):
+                return navn
+        return None
+
+    df = df.copy()
+    df["Reiselivsregion"] = df[geo_col].map(_lookup)
+    return df
+
+
+def region_navn_til_kode(navn: str) -> str:
+    for kode, n in REISELIVSREGIONER.items():
+        if n == navn:
+            return kode
+    raise KeyError(navn)
+
+# =============================================================================
+# VERDISKAPING (Innovasjon Norge-tall)
+# =============================================================================
+
+_KOMMUNE_TIL_REGION: dict[str, str] = {
+    # Kildefilen bruker kommunenavn, ikke kommunenummer -- egen navnenøkkel her.
+    "Bærum": "Asker/Bærum",
+    "Asker": "Asker/Bærum",
+    "Nordre Follo": "Follo",
+    "Nesodden": "Follo",
+    "Frogn": "Follo",
+    "Vestby": "Follo",
+    "Ås": "Follo",
+    "Enebakk": "Follo",
+    "Lillestrøm": "Romerike/Hadeland",
+    "Ullensaker": "Romerike/Hadeland",
+    "Lørenskog": "Romerike/Hadeland",
+    "Rælingen": "Romerike/Hadeland",
+    "Aurskog-Høland": "Romerike/Hadeland",
+    "Nes": "Romerike/Hadeland",
+    "Gjerdrum": "Romerike/Hadeland",
+    "Nittedal": "Romerike/Hadeland",
+    "Lunner": "Romerike/Hadeland",
+    "Jevnaker": "Romerike/Hadeland",
+    "Nannestad": "Romerike/Hadeland",
+    "Eidsvoll": "Romerike/Hadeland",
+    "Hurdal": "Romerike/Hadeland",
+}
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def load_verdiskaping() -> pd.DataFrame:
+    """Les den lokale verdiskapings-CSV-en og legg til reiselivsregion."""
+    df = pd.read_csv(VERDISKAPING_CSV)
+    df["Reiselivsregion"] = df["Kommune"].map(_KOMMUNE_TIL_REGION)
+    return df
+
+
+def resolve_year(requested_year: int) -> tuple[int, bool]:
+    """
+    Verdiskapingstallene finnes kun t.o.m. VERDISKAPING_MAX_YEAR (årlige tall,
+    typisk 9-12 mnd etterslep). Returnerer (år_å_bruke, ble_justert).
+    """
+    if requested_year > VERDISKAPING_MAX_YEAR:
+        return VERDISKAPING_MAX_YEAR, True
+    return requested_year, False
+
+
+def filter_verdiskaping(df: pd.DataFrame, year: int, regions: list[str]) -> pd.DataFrame:
+    out = df[df["Regnskapsår"] == year]
+    if regions:
+        out = out[out["Reiselivsregion"].isin(regions)]
+    return out
+
+
+def per_bransje(df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        df.groupby("Næring", as_index=False)["Verdiskaping"]
+        .sum()
+        .sort_values("Verdiskaping", ascending=False)
+    )
+
+
+def per_kommune(df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        df.groupby("Kommune", as_index=False)["Verdiskaping"]
+        .sum()
+        .sort_values("Verdiskaping", ascending=False)
+    )
+
+
+def per_region_trend(df: pd.DataFrame, regions: list[str]) -> pd.DataFrame:
+    """Total verdiskaping per år og region, for hele tidsserien (uavhengig av valgt år)."""
+    out = df if not regions else df[df["Reiselivsregion"].isin(regions)]
+    return (
+        out.groupby(["Regnskapsår", "Reiselivsregion"], as_index=False)["Verdiskaping"]
+        .sum()
+    )
+
+
+def verdiskaping_total(df: pd.DataFrame) -> float:
+    return float(df["Verdiskaping"].sum())
+
+# =============================================================================
+# STREAMLIT-APP
+# =============================================================================
 
 # ---------------------------------------------------------------------------
 # Hjelpefunksjoner for å finne riktig kolonne i SSB-tabeller uten å hardkode
@@ -140,7 +531,7 @@ tab_overnatting, tab_nokkeltall, tab_verdiskaping, tab_om = st.tabs(
 
 with tab_overnatting:
     try:
-        raw = dl.load_overnattinger(START_YEAR)
+        raw = load_overnattinger(START_YEAR)
     except SSBApiError as e:
         st.error(f"Klarte ikke hente overnattingsdata fra SSB.\n\n{e}")
         st.stop()
@@ -219,8 +610,8 @@ with tab_nokkeltall:
         "tabellene."
     )
     try:
-        omsetning_df = dl.load_omsetning_utnyttelse(START_YEAR)
-        nokkel_df = dl.load_nokkelindikatorer(START_YEAR)
+        omsetning_df = load_omsetning_utnyttelse(START_YEAR)
+        nokkel_df = load_nokkelindikatorer(START_YEAR)
     except SSBApiError as e:
         st.error(f"Klarte ikke hente nøkkeltall fra SSB.\n\n{e}")
         st.stop()
@@ -315,25 +706,25 @@ with tab_verdiskaping:
         "påvirker ikke denne fanen."
     )
 
-    vsk_df_all = vsk.load_verdiskaping()
-    vsk_year, ble_justert = vsk.resolve_year(valgt_ar)
+    vsk_df_all = load_verdiskaping()
+    vsk_year, ble_justert = resolve_year(valgt_ar)
     if ble_justert:
         st.info(
             f"Verdiskapingstall finnes t.o.m. {vsk_year} (nyeste tilgjengelige "
             f"år i kildefilen). Viser {vsk_year} i stedet for {valgt_ar}."
         )
 
-    vsk_df = vsk.filter_verdiskaping(vsk_df_all, vsk_year, valgte_regioner)
+    vsk_df = filter_verdiskaping(vsk_df_all, vsk_year, valgte_regioner)
 
     try:
-        befolkning_df = dl.load_befolkning(START_YEAR)
+        befolkning_df = load_befolkning(START_YEAR)
         befolkning_df = filter_period(befolkning_df, vsk_year, [])
         befolkning_df = region_filter(befolkning_df, valgte_regioner)
         befolkning_total = sum_value(befolkning_df)
     except SSBApiError:
         befolkning_total = None
 
-    total_verdiskaping = vsk.total(vsk_df)
+    total_verdiskaping = verdiskaping_total(vsk_df)
 
     c1, c2 = st.columns(2)
     c1.metric(f"Verdiskaping totalt ({vsk_year})", f"{total_verdiskaping / 1e6:,.0f} mill. kr".replace(",", " "))
@@ -348,7 +739,7 @@ with tab_verdiskaping:
     col_a, col_b = st.columns(2)
     with col_a:
         st.subheader("Verdiskaping per reiselivsbransje")
-        bransje_df = vsk.per_bransje(vsk_df)
+        bransje_df = per_bransje(vsk_df)
         fig = px.bar(
             bransje_df, x="Næring", y="Verdiskaping", text_auto=".2s",
             labels={"Verdiskaping": "Verdiskaping (kr)", "Næring": "Bransje"},
@@ -357,7 +748,7 @@ with tab_verdiskaping:
 
     with col_b:
         st.subheader("Verdiskaping per kommune")
-        kommune_df = vsk.per_kommune(vsk_df)
+        kommune_df = per_kommune(vsk_df)
         fig = px.bar(
             kommune_df, x="Kommune", y="Verdiskaping", text_auto=".2s",
             labels={"Verdiskaping": "Verdiskaping (kr)"},
@@ -366,7 +757,7 @@ with tab_verdiskaping:
         st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Utvikling over tid, per reiselivsregion")
-    trend_df = vsk.per_region_trend(vsk_df_all, valgte_regioner)
+    trend_df = per_region_trend(vsk_df_all, valgte_regioner)
     fig = px.line(
         trend_df, x="Regnskapsår", y="Verdiskaping", color="Reiselivsregion",
         markers=True, labels={"Verdiskaping": "Verdiskaping (kr)"},

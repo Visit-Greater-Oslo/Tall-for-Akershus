@@ -209,8 +209,13 @@ def jsonstat_to_dataframe(jsonstat_text: str) -> pd.DataFrame:
             "Mangler pakken 'pyjstat'. Kjør: pip install pyjstat"
         ) from exc
 
-    data = json.loads(jsonstat_text)
-    ds = pyjstat.Dataset.read(data)
+    # Gir rå JSON-tekst rett til pyjstat i stedet for å forhåndsparse den selv:
+    # pyjstat forventer enten en URL/JSON-streng (som den parser med sin egen
+    # OrderedDict-hook) eller et allerede parset OrderedDict-objekt -- en vanlig
+    # dict (det json.loads() gir som standard) blir feiltolket som noe som skal
+    # leses fra fil/URL, og feiler med "AttributeError: 'dict' object has no
+    # attribute 'read'".
+    ds = pyjstat.Dataset.read(jsonstat_text)
     df = ds.write("dataframe")
     # pyjstat gir egne kolonnenavn per dimensjon-label og en "value"-kolonne.
     df.columns = [str(c).strip() for c in df.columns]

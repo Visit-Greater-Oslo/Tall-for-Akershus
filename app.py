@@ -486,6 +486,43 @@ def sum_value(df: pd.DataFrame) -> float:
     return pd.to_numeric(df[v], errors="coerce").sum()
 
 
+def filter_to_matching_label(df: pd.DataFrame, colname: str | None, *keywords: str) -> pd.DataFrame:
+    """Behold kun rader der colname inneholder ett av søkeordene (case-insensitive)."""
+    if colname is None:
+        return df
+    labels_lower = df[colname].astype(str).str.lower()
+    mask = labels_lower.apply(lambda s: any(k.lower() in s for k in keywords))
+    return df[mask]
+
+
+# Kandidat-etiketter SSB typisk bruker for totalkategorien innenfor en
+# dimensjon (f.eks. bostedsland). Vi matcher EKSAKT (ikke "inneholder"),
+# fordi f.eks. "Utlandet i alt" inneholder delstrengen "i alt" og ville blitt
+# feilaktig plukket opp av en substreng-sjekk mot totalraden "I alt".
+TOTAL_LABEL_CANDIDATES = ["i alt", "alle", "totalt"]
+NORGE_LABEL_CANDIDATES = ["norge"]
+
+
+def pick_exact_label(
+    df: pd.DataFrame, colname: str | None, candidates: list[str]
+) -> tuple[pd.DataFrame | None, str | None]:
+    """
+    Finn radene som EKSAKT matcher en av kandidat-etikettene (case-insensitive,
+    trimmet). Brukes for å plukke ut en éntydig total-/landsgruppe-rad fra en
+    dimensjon som også inneholder enkeltland eller andre undergrupper --
+    summering av HELE kolonnen ville dobbelttelle (total + landsgrupper +
+    enkeltland oppå hverandre).
+    """
+    if colname is None:
+        return None, None
+    labels_lower = df[colname].astype(str).str.strip().str.lower()
+    for cand in candidates:
+        mask = labels_lower == cand
+        if mask.any():
+            return df[mask], cand
+    return None, None
+
+
 # ---------------------------------------------------------------------------
 # Sidepanel -- filtre
 # ---------------------------------------------------------------------------
@@ -527,7 +564,7 @@ st.caption(
 )
 
 tab_overnatting, tab_nokkeltall, tab_verdiskaping, tab_om = st.tabs(
-    ["🛏️ Overnattinger", "💰 Nøkkeltall hotell", "📈 Verdiskaping", "ℹ️ Om data og forbehold"]
+    ["🛏️ Hotellovernattinger", "💰 Nøkkeltall hotell", "📈 Verdiskaping", "ℹ️ Om data og forbehold"]
 )
 
 # ---------------------------------------------------------------------------
@@ -541,66 +578,104 @@ with tab_overnatting:
         st.error(f"Klarte ikke hente overnattingsdata fra SSB.\n\n{e}")
         st.stop()
 
-    df = region_filter(raw, valgte_regioner)
+    innkvart_col = col(raw, "innkvarteringstype", "innkvartering")
+    bosted_col = col(raw, "bostedsland", "bosted")
+
+    # Denne fanen viser KUN hotellovernattinger (avklart med oppdragsgiver) --
+    # camping, hyttegrend m.m. filtreres bort med en gang, før noe annet
+    # regnes ut, slik at ALT under (KPI-er, trend, regionfordeling) er
+    # hotell-tall.
+    if innkvart_col:
+        raw_hotell = filter_to_matching_label(raw, innkvart_col, "hotell")
+        if raw_hotell.empty:
+            st.warning(
+                "Fant ingen rader merket 'hotell' i innkvarteringstype-kolonnen "
+                "for tabell 14172 -- SSB kan ha endret kategorinavnet. Viser "
+                "alle innkvarteringstyper i stedet (se rådata under)."
+            )
+            raw_hotell = raw
+    else:
+        raw_hotell = raw
+
+    st.caption("Viser kun hotellovernattinger (camping, hyttegrend m.m. er utelatt).")
+
+    df = region_filter(raw_hotell, valgte_regioner)
     df = filter_period(df, valgt_ar, valgte_maneder)
 
-    innkvart_col = col(df, "innkvarteringstype", "innkvartering")
-    bosted_col = col(df, "bostedsland", "bosted")
-    v = value_col(df)
-
-    total = sum_value(df)
+    # Bostedsland-dimensjonen inneholder normalt en totalrad ("I alt"), én
+    # rad for "Norge", én for "Utlandet i alt" OG enkeltland -- summering av
+    # HELE kolonnen ville lagt alt dette oppå hverandre. Vi plukker derfor ut
+    # de eksakte radene vi trenger i stedet.
+    total_df, _ = pick_exact_label(df, bosted_col, TOTAL_LABEL_CANDIDATES)
+    norge_df, _ = pick_exact_label(df, bosted_col, NORGE_LABEL_CANDIDATES)
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Overnattinger totalt", f"{total:,.0f}".replace(",", " "))
 
-    if bosted_col:
-        norge_mask = df[bosted_col].astype(str).str.contains("norge", case=False, na=False)
-        norsk = sum_value(df[norge_mask])
-        internasjonalt = sum_value(df[~norge_mask])
+    total = sum_value(total_df) if total_df is not None else None
+    c1.metric("Hotellovernattinger totalt", f"{total:,.0f}".replace(",", " ") if total is not None else "—")
+
+    norsk = internasjonalt = None
+    if total_df is not None and norge_df is not None:
+        norsk = sum_value(norge_df)
+        internasjonalt = total - norsk
         c2.metric("Norske overnattinger", f"{norsk:,.0f}".replace(",", " "))
         c3.metric("Internasjonale overnattinger", f"{internasjonalt:,.0f}".replace(",", " "))
     else:
         c2.metric("Norske overnattinger", "—")
         c3.metric("Internasjonale overnattinger", "—")
 
+    if bosted_col and (total_df is None or norge_df is None):
+        st.info(
+            "Fant ikke entydige rader for 'I alt' og 'Norge' i "
+            "bostedsland-kolonnen for det valgte utvalget, så tallene over "
+            "kan ikke vises trygt akkurat nå. Sjekk eksakte kategorinavn i "
+            "rådata-panelet nederst."
+        )
+
     st.divider()
 
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.subheader("Overnattinger etter innkvarteringstype")
-        if innkvart_col:
-            fig = px.bar(
-                df.groupby(innkvart_col, as_index=False)[v].sum(),
-                x=innkvart_col, y=v, text_auto=".2s",
-                labels={v: "Overnattinger", innkvart_col: "Type"},
+        st.subheader("Norske vs. internasjonale overnattinger")
+        if norsk is not None and internasjonalt is not None:
+            fordeling = pd.DataFrame(
+                {"Type": ["Norske", "Internasjonale"], "Overnattinger": [norsk, internasjonalt]}
             )
+            fig = px.bar(fordeling, x="Type", y="Overnattinger", text_auto=".2s")
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("Fant ikke en egen 'innkvarteringstype'-kolonne i denne tabellen.")
+            st.info("Se merknad over.")
 
     with col_b:
         st.subheader("Utvikling over tid")
         tid_col = col(df, "måned", "tid")
         if tid_col:
-            trend = raw.copy()
-            trend = region_filter(trend, valgte_regioner)
-            trend = trend.groupby(tid_col, as_index=False)[value_col(trend)].sum()
-            fig = px.line(trend, x=tid_col, y=value_col(trend), markers=True,
-                          labels={value_col(trend): "Overnattinger", tid_col: "Måned"})
-            st.plotly_chart(fig, use_container_width=True)
+            trend_source, _ = pick_exact_label(
+                region_filter(raw_hotell, valgte_regioner), bosted_col, TOTAL_LABEL_CANDIDATES
+            )
+            if trend_source is not None:
+                trend = trend_source.groupby(tid_col, as_index=False)[value_col(trend_source)].sum()
+                fig = px.line(
+                    trend, x=tid_col, y=value_col(trend), markers=True,
+                    labels={value_col(trend): "Hotellovernattinger", tid_col: "Måned"},
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Fant ikke totalrad for bostedsland -- kan ikke vise trend trygt.")
 
     st.subheader("Fordeling per reiselivsregion")
     region_col = col(df, "reiselivsregion", "region")
-    if region_col:
+    if region_col and total_df is not None:
+        v_total = value_col(total_df)
         fig = px.bar(
-            df.groupby(region_col, as_index=False)[v].sum().sort_values(v, ascending=False),
-            x=region_col, y=v, text_auto=".2s",
-            labels={v: "Overnattinger", region_col: "Reiselivsregion"},
+            total_df.groupby(region_col, as_index=False)[v_total].sum().sort_values(v_total, ascending=False),
+            x=region_col, y=v_total, text_auto=".2s",
+            labels={v_total: "Hotellovernattinger", region_col: "Reiselivsregion"},
         )
         st.plotly_chart(fig, use_container_width=True)
 
-    with st.expander("Vis rådata"):
+    with st.expander("Vis rådata (kun hotell, valgt periode)"):
         st.dataframe(df, use_container_width=True)
 
 # ---------------------------------------------------------------------------
@@ -808,6 +883,13 @@ with tab_om:
    Norge-filen, inkludert et forsøk på verdiskaping per innbygger (delt
    på SSBs befolkningstall for samme område). Tallene er årlige og går
    t.o.m. 2024 — nyere år vises ikke før kildefilen oppdateres.
+4. **Overnattingsfanen viser kun hotell** — camping, hyttegrend og andre
+   innkvarteringstyper i tabell 14172 filtreres bort. Norsk/internasjonalt-
+   fordelingen beregnes ved å plukke ut de eksakte radene "I alt" og
+   "Norge" fra bostedsland-kolonnen (internasjonalt = totalt − norsk),
+   i stedet for å summere hele kolonnen — bostedsland inneholder nemlig
+   både en totalsum, landsgrupper og enkeltland samtidig, og en ren
+   summering ville telt alt dette flere ganger oppå hverandre.
 
 ### Supplerende kilder å vurdere for v2
 - [Visit Norway / Innovasjon Norge – statistikk og verktøy](https://reiseliv.innovasjonnorge.no/seksjon/statistikk-og-verktoy)

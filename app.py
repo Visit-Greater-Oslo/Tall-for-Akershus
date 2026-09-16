@@ -13,16 +13,40 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from src import data_loader as dl
-from src import verdiskaping as vsk
-from src.config import FYLKE_NAVN, MONTHS, REISELIVSREGIONER, START_YEAR, YEARS
-from src.ssb_client import SSBApiError
-
 st.set_page_config(
     page_title="Reiseliv i Akershus",
     page_icon="🧭",
     layout="wide",
 )
+
+# ---------------------------------------------------------------------------
+# Robust import av egne moduler: Streamlit sladder normalt den ekte
+# feilmeldingen ved en ModuleNotFoundError ("for å hindre datalekkasjer") og
+# viser bare hvilken linje i app.py som utløste den -- ikke hvilken pakke som
+# faktisk mangler. Vi fanger derfor feilen selv og skriver den ut i klartekst,
+# sammen med en sjekkliste, slik at den er mulig å rette uten å måtte lete i
+# Streamlit Cloud-loggene.
+# ---------------------------------------------------------------------------
+try:
+    import data_loader as dl
+    import verdiskaping as vsk
+    from config import FYLKE_NAVN, MONTHS, REISELIVSREGIONER, START_YEAR, YEARS
+    from ssb_client import SSBApiError
+except ModuleNotFoundError as exc:
+    st.error(f"Appen mangler en fil eller avhengighet og kan ikke starte: **{exc}**")
+    st.markdown(
+        """
+**Sjekkliste:**
+1. Ligger `config.py`, `ssb_client.py`, `data_loader.py`, `verdiskaping.py`
+   og `verdiskaping_akershus.csv` alle direkte i repo-**roten**, på samme
+   nivå som `app.py`? (Denne versjonen bruker ingen undermapper — hvis en
+   av disse filene mangler i GitHub-repoet ditt, er det årsaken.)
+2. Ligger `requirements.txt` også i repo-roten?
+3. Prøv "Reboot app" under "Manage app" på Streamlit Cloud etter at du har
+   rettet punktene over.
+        """
+    )
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # Hjelpefunksjoner for å finne riktig kolonne i SSB-tabeller uten å hardkode
@@ -370,7 +394,7 @@ with tab_om:
   - 07459 – Befolkning
 - **Innovasjon Norges verdiskapingstall for reiselivet** (regnskapsbasert,
   Brønnøysundregistrene/Menon-metodikk), levert som Excel-uttrekk og lagt
-  inn som `data/manual/verdiskaping_akershus.csv`. Dekker verdiskaping,
+  inn som `verdiskaping_akershus.csv`. Dekker verdiskaping,
   ansatte, årsverk og antall foretak per kommune, bransje og år
   (2015–2024).
 
@@ -396,6 +420,6 @@ with tab_om:
 
 Ingen av disse har åpne, maskinlesbare API-er på linje med SSB, så de må
 per i dag hentes inn manuelt (nedlastede filer / kopiert inn i egne
-CSV-er under `data/manual/`) hvis du vil kombinere dem med SSB-tallene.
+CSV-er under `(rotmappen, ikke undermappe)/`) hvis du vil kombinere dem med SSB-tallene.
         """
     )

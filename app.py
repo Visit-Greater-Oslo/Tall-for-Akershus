@@ -501,6 +501,7 @@ def filter_to_matching_label(df: pd.DataFrame, colname: str | None, *keywords: s
 # feilaktig plukket opp av en substreng-sjekk mot totalraden "I alt".
 TOTAL_LABEL_CANDIDATES = ["i alt", "alle", "totalt"]
 NORGE_LABEL_CANDIDATES = ["norge"]
+UTLAND_LABEL_CANDIDATES = ["utlandet i alt", "i alt utlandet", "utlandet"]
 
 
 def pick_exact_label(
@@ -579,7 +580,10 @@ with tab_overnatting:
         st.stop()
 
     innkvart_col = col(raw, "innkvarteringstype", "innkvartering")
-    bosted_col = col(raw, "bostedsland", "bosted")
+    # NB: SSB bruker nynorsk-stavemåten "bustadland" i denne tabellen
+    # (bekreftet i tabellens offisielle tittel), ikke "bostedsland" -- derfor
+    # må vi lete etter begge stavemåtene, ellers finner vi ikke kolonnen.
+    bosted_col = col(raw, "bostedsland", "bosted", "bustadland", "bustad")
 
     # Denne fanen viser KUN hotellovernattinger (avklart med oppdragsgiver) --
     # camping, hyttegrend m.m. filtreres bort med en gang, før noe annet
@@ -605,32 +609,47 @@ with tab_overnatting:
     # Bostedsland-dimensjonen inneholder normalt en totalrad ("I alt"), én
     # rad for "Norge", én for "Utlandet i alt" OG enkeltland -- summering av
     # HELE kolonnen ville lagt alt dette oppå hverandre. Vi plukker derfor ut
-    # de eksakte radene vi trenger i stedet.
+    # de tre eksakte radene vi trenger i stedet for å summere alt.
     total_df, _ = pick_exact_label(df, bosted_col, TOTAL_LABEL_CANDIDATES)
     norge_df, _ = pick_exact_label(df, bosted_col, NORGE_LABEL_CANDIDATES)
+    utland_df, _ = pick_exact_label(df, bosted_col, UTLAND_LABEL_CANDIDATES)
 
     c1, c2, c3 = st.columns(3)
 
     total = sum_value(total_df) if total_df is not None else None
     c1.metric("Hotellovernattinger totalt", f"{total:,.0f}".replace(",", " ") if total is not None else "—")
 
-    norsk = internasjonalt = None
-    if total_df is not None and norge_df is not None:
-        norsk = sum_value(norge_df)
-        internasjonalt = total - norsk
-        c2.metric("Norske overnattinger", f"{norsk:,.0f}".replace(",", " "))
-        c3.metric("Internasjonale overnattinger", f"{internasjonalt:,.0f}".replace(",", " "))
-    else:
-        c2.metric("Norske overnattinger", "—")
-        c3.metric("Internasjonale overnattinger", "—")
+    norsk = sum_value(norge_df) if norge_df is not None else None
+    internasjonalt = sum_value(utland_df) if utland_df is not None else None
+    c2.metric("Norske overnattinger", f"{norsk:,.0f}".replace(",", " ") if norsk is not None else "—")
+    c3.metric(
+        "Internasjonale overnattinger",
+        f"{internasjonalt:,.0f}".replace(",", " ") if internasjonalt is not None else "—",
+    )
 
-    if bosted_col and (total_df is None or norge_df is None):
-        st.info(
-            "Fant ikke entydige rader for 'I alt' og 'Norge' i "
-            "bostedsland-kolonnen for det valgte utvalget, så tallene over "
-            "kan ikke vises trygt akkurat nå. Sjekk eksakte kategorinavn i "
-            "rådata-panelet nederst."
+    if bosted_col is None:
+        st.warning(
+            "Fant ikke en 'bostedsland/bustadland'-kolonne i tabell 14172 i "
+            "det hele tatt -- se listen over faktiske kolonnenavn i "
+            "rådata-panelet nederst, så kan søkeordene i koden (`col(raw, "
+            "\"bostedsland\", \"bosted\", \"bustadland\", \"bustad\")`) rettes opp."
         )
+    elif total_df is None or norge_df is None or utland_df is None:
+        faktiske_kategorier = sorted(df[bosted_col].dropna().unique().tolist())
+        st.info(
+            "Fant ikke entydige rader for 'I alt', 'Norge' og/eller "
+            f"'Utlandet i alt' i bostedsland-kolonnen ('{bosted_col}') for "
+            f"det valgte utvalget. Faktiske kategorier funnet: {faktiske_kategorier}"
+        )
+    elif total is not None and norsk is not None and internasjonalt is not None:
+        avvik = total - (norsk + internasjonalt)
+        if abs(avvik) > max(1.0, total * 0.01):
+            st.caption(
+                f"⚠️ Merk: totalt ({total:,.0f}) stemmer ikke helt med "
+                f"norsk + internasjonalt ({norsk + internasjonalt:,.0f}) -- "
+                f"avvik på {avvik:,.0f}. Kan skyldes uoppgitt bostedsland "
+                f"i kildedataene.".replace(",", " ")
+            )
 
     st.divider()
 

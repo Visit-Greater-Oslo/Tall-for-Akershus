@@ -457,7 +457,7 @@ def col(df: pd.DataFrame, *keywords: str) -> str | None:
 
 
 def filter_period(df: pd.DataFrame, year: int, months: list[int]) -> pd.DataFrame:
-    tid_col = col(df, "måned", "tid", "time")
+    tid_col = col(df, "måned", "månad", "tid", "time")
     if tid_col is None:
         return df
     df = df.copy()
@@ -668,7 +668,7 @@ with tab_overnatting:
 
     with col_b:
         st.subheader("Utvikling over tid")
-        tid_col = col(df, "måned", "tid")
+        tid_col = col(df, "måned", "månad", "tid")
         if tid_col:
             trend_source, _ = pick_exact_label(
                 region_filter(raw_hotell, valgte_regioner), bosted_col, TOTAL_LABEL_CANDIDATES
@@ -716,50 +716,47 @@ with tab_nokkeltall:
         st.stop()
 
     # --- RevPAR = Losjiomsetning per tilgjengelig rom -----------------------
-    # Beregnes selv i stedet for å stole på at SSB har en ferdig "RevPAR"-rad,
-    # siden vi ikke kan bekrefte det eksakte indikatornavnet live. Hvis vi
-    # ikke finner begge nødvendige rader, vises panelet rett og slett ikke.
+    # SSB har allerede en ferdig, egen indikatorrad for nettopp dette i
+    # tabell 14176 -- "Losjiomsetning per tilgjengeleg rom (kr)" (nynorsk).
+    # Vi bruker derfor raden direkte i stedet for å dele to andre rader på
+    # hverandre. Hvis vi ikke finner raden, vises panelet rett og slett ikke.
     st.subheader("RevPAR — Losjiomsetning per tilgjengelig rom")
     revpar_df = region_filter(omsetning_df, valgte_regioner)
     revpar_df = filter_period(revpar_df, valgt_ar, valgte_maneder)
     indikator_col = col(revpar_df, "statistikkvariabel", "contentscode", "indikator")
-    tid_col = col(revpar_df, "måned", "tid")
+    tid_col = col(revpar_df, "måned", "månad", "tid")
     region_col = col(revpar_df, "reiselivsregion", "region")
     v = value_col(revpar_df)
 
     revpar_computed = False
     if indikator_col and tid_col and region_col:
         labels = revpar_df[indikator_col].dropna().unique().tolist()
-        losji_label = next((l for l in labels if "losji" in str(l).lower()), None)
-        rom_label = next(
-            (l for l in labels if ("tilgjengelig" in str(l).lower() or "disponibl" in str(l).lower())
-             and "rom" in str(l).lower()),
+        revpar_label = next(
+            (l for l in labels if "losji" in str(l).lower()
+             and "rom" in str(l).lower()
+             and ("tilgjengelig" in str(l).lower()  # bokmål
+                  or "tilgjengeleg" in str(l).lower()  # nynorsk
+                  or "disponibl" in str(l).lower())),
             None,
         )
-        if losji_label and rom_label:
-            losji = revpar_df[revpar_df[indikator_col] == losji_label][[tid_col, region_col, v]]
-            rom = revpar_df[revpar_df[indikator_col] == rom_label][[tid_col, region_col, v]]
-            merged = losji.merge(rom, on=[tid_col, region_col], suffixes=("_losji", "_rom"))
-            merged = merged[merged[f"{v}_rom"].astype(float) > 0]
-            if not merged.empty:
-                merged["RevPAR"] = pd.to_numeric(merged[f"{v}_losji"], errors="coerce") / pd.to_numeric(
-                    merged[f"{v}_rom"], errors="coerce"
-                )
+        if revpar_label:
+            revpar_rows = revpar_df[revpar_df[indikator_col] == revpar_label]
+            if not revpar_rows.empty:
                 fig = px.line(
-                    merged.sort_values(tid_col), x=tid_col, y="RevPAR", color=region_col,
-                    markers=True, labels={tid_col: "Måned", "RevPAR": "RevPAR (kr)"},
+                    revpar_rows.sort_values(tid_col), x=tid_col, y=v, color=region_col,
+                    markers=True, labels={tid_col: "Måned", v: "RevPAR (kr)"},
                 )
                 st.plotly_chart(fig, use_container_width=True)
                 revpar_computed = True
 
     if not revpar_computed:
         st.info(
-            "Fant ikke rader for både 'losjiomsetning' og 'tilgjengelige "
-            "rom' i tabell 14176 for det valgte utvalget, så RevPAR kan "
-            "ikke beregnes akkurat nå. Sjekk indikatornavnene i "
-            "rådata-panelet under for å se om oppslaget i "
-            "`app.py` (funksjonen som finner disse to radene) bør justeres."
+            "Fant ikke en rad for 'losjiomsetning per tilgjengelig/tilgjengeleg "
+            "rom' i tabell 14176 for det valgte utvalget, så RevPAR kan ikke "
+            "vises akkurat nå. Sjekk de faktiske indikatornavnene i "
+            "rådata-panelet under."
         )
+
 
     st.divider()
 
@@ -780,7 +777,7 @@ with tab_nokkeltall:
                 "Velg indikator", indikatorer, key=f"indikator_{label}"
             )
             plot_df = df[df[indikator_col] == valgt_indikator]
-            tid_col = col(plot_df, "måned", "tid")
+            tid_col = col(plot_df, "måned", "månad", "tid")
             region_col = col(plot_df, "reiselivsregion", "region")
             if tid_col and region_col:
                 fig = px.line(
@@ -891,12 +888,11 @@ with tab_om:
 ### Avklarte forhold (oppdatert etter tilbakemelding)
 1. **Korttidsutleie (Airbnb/Booking.com) er bevisst tatt ut av omfanget**
    og hentes ikke inn i denne versjonen.
-2. **RevPAR er definert som losjiomsetning per tilgjengelig rom**, og
-   beregnes i appen ved å dele "losjiomsetning"-raden på
-   "tilgjengelige/disponible rom"-raden i tabell 14176 for samme
-   region/måned — i stedet for å stole på at SSB har en egen ferdig
-   RevPAR-rad et sted vi ikke har kunnet bekrefte navnet på. Hvis appen
-   ikke finner begge radene for et gitt utvalg, vises panelet rett og
+2. **RevPAR er definert som losjiomsetning per tilgjengelig rom**. SSB har
+   selv en ferdig indikatorrad for nettopp dette i tabell 14176 —
+   "Losjiomsetning per tilgjengeleg rom (kr)" (nynorsk) — som appen bruker
+   direkte, i stedet for å regne det ut selv fra to andre rader. Hvis
+   appen ikke finner raden for et gitt utvalg, vises panelet rett og
    slett ikke (i stedet for et feilaktig tall).
 3. **Verdiskaping per bransje og kommune er nå dekket** via Innovasjon
    Norge-filen, inkludert et forsøk på verdiskaping per innbygger (delt
@@ -904,11 +900,18 @@ with tab_om:
    t.o.m. 2024 — nyere år vises ikke før kildefilen oppdateres.
 4. **Overnattingsfanen viser kun hotell** — camping, hyttegrend og andre
    innkvarteringstyper i tabell 14172 filtreres bort. Norsk/internasjonalt-
-   fordelingen beregnes ved å plukke ut de eksakte radene "I alt" og
-   "Norge" fra bostedsland-kolonnen (internasjonalt = totalt − norsk),
-   i stedet for å summere hele kolonnen — bostedsland inneholder nemlig
-   både en totalsum, landsgrupper og enkeltland samtidig, og en ren
-   summering ville telt alt dette flere ganger oppå hverandre.
+   fordelingen hentes ved å plukke ut de eksakte radene "I alt", "Norge"
+   og "Utlandet i alt" fra bustadland-kolonnen, i stedet for å summere
+   hele kolonnen — den inneholder nemlig en totalsum, landsgrupper OG
+   enkeltland samtidig, og en ren summering ville telt alt dette flere
+   ganger oppå hverandre.
+5. **SSB bruker nynorsk i disse tabellene** (f.eks. "bustadland" i stedet
+   for "bostedsland", "liknande" i stedet for "lignende"). Koden søker
+   derfor etter både bokmål- og nynorsk-varianter av ord den leter etter
+   i kolonnenavn og kategorier (f.eks. "bostedsland"/"bustadland",
+   "tilgjengelig"/"tilgjengeleg"), og viser en tydelig varsel-boks med de
+   faktiske kategorinavnene hvis den ikke finner det den leter etter.
+
 
 ### Supplerende kilder å vurdere for v2
 - [Visit Norway / Innovasjon Norge – statistikk og verktøy](https://reiseliv.innovasjonnorge.no/seksjon/statistikk-og-verktoy)
